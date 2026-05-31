@@ -1,4 +1,4 @@
-#VERSION: 1.01
+#VERSION: 3.00
 # AUTHORS: (you)
 # LICENSING INFORMATION
 #
@@ -40,6 +40,11 @@
 #   BT4G_MIN_DELAY      min seconds between requests, default 1.5
 #   BT4G_MAX_DELAY      max seconds between requests, default 4.0
 #   BT4G_BASE_URL       override base URL if the domain/mirror changes
+#   BT4G_PAGE_PARAM     query param name for pagination, default "p"; set to ""
+#                       to disable paging (single page of results)
+#   BT4G_SORT_PARAM     query param name for sorting, default "orderby"; set to
+#                       "" to drop sorting from the URL (site default order)
+#   BT4G_SORT_VALUE     value for the sort param, default "seeders"
 #   BT4G_LOG_FILE       path for a tailable log (default /config/bt4gprx.log, then
 #                       /tmp/bt4gprx.log); set to "" to disable file logging
 #   BT4G_LOG_LEVEL      DEBUG | INFO | WARNING | ERROR | CRITICAL (default ERROR).
@@ -191,19 +196,21 @@ class bt4gprx(object):
     url = os.environ.get("BT4G_BASE_URL", "https://bt4gprx.com")
     name = "bt4gprx"
 
-    # qBittorrent's fixed category set mapped onto bt4g's path prefixes.
-    # bt4g groups things coarsely; where it has no distinct bucket we fall back
-    # to '' (search everything). Adjust freely if the site adds categories.
+    # qBittorrent's fixed categories mapped onto bt4g's `category=` query values.
+    # bt4g's valid categories are: all, video, audio, doc, app, other. We send no
+    # category for "all" (search everything). NOTE: a confirmed example URL showed
+    # category=movie, which conflicts with the enumerated set (video); this map
+    # uses "video" per the enumerated set — change to "movie" here if needed.
     supported_categories = {
         "all": "",
-        "movies": "movie/",
-        "tv": "movie/",       # bt4g has no separate TV bucket; it's all "movie/"
-        "anime": "movie/",
-        "music": "audio/",
-        "books": "doc/",
-        "software": "app/",
-        "games": "app/",
-        "pictures": "",       # no dedicated image bucket; search all
+        "movies": "video",
+        "tv": "video",        # bt4g has no separate TV bucket
+        "anime": "video",
+        "music": "audio",
+        "books": "doc",
+        "software": "app",
+        "games": "app",
+        "pictures": "other",  # closest bt4g bucket for images/misc
     }
 
     def __init__(self):
@@ -212,6 +219,13 @@ class bt4gprx(object):
         self.max_pages = self._int_env("BT4G_MAX_PAGES", 3)
         self.min_delay = self._float_env("BT4G_MIN_DELAY", 1.5)
         self.max_delay = self._float_env("BT4G_MAX_DELAY", 4.0)
+        # Query-string parameter names for the /search endpoint. Confirmed format:
+        #   /search?q=<term>&category=<cat>&orderby=seeders&p=<page>
+        # All are overridable in case the site changes. Set BT4G_PAGE_PARAM="" to
+        # disable paging, or BT4G_SORT_PARAM="" to drop sorting from the URL.
+        self.page_param = os.environ.get("BT4G_PAGE_PARAM", "p").strip()
+        self.sort_param = os.environ.get("BT4G_SORT_PARAM", "orderby").strip()
+        self.sort_value = os.environ.get("BT4G_SORT_VALUE", "seeders").strip()
         self._session = None          # lazy curl_cffi session (keeps cf_clearance)
         self._fs_session = None       # lazy FlareSolverr session id
         self._trackers = list(_DEFAULT_TRACKERS)
@@ -535,9 +549,22 @@ class bt4gprx(object):
 
     # ------------------------------------------------------------------- search
     def _search_url(self, what, cat, page):
-        prefix = self.supported_categories.get(cat, "")
-        base = self.url.rstrip("/") + "/"
-        return "%s%ssearch/%s/byseeders/%d" % (base, prefix, what, page)
+        # Confirmed format:
+        #   https://bt4gprx.com/search?q=<term>&category=<cat>&orderby=seeders&p=<n>
+        # `what` arrives URL-encoded from nova2 (quote -> spaces as %20). Normalize
+        # any '+' (from a quote_plus variant) to %20 so spaces are always %20, as
+        # the site requires. A real '+' in the term is %2B and is left untouched.
+        q = what.replace("+", "%20").replace(" ", "%20")
+        base = self.url.rstrip("/") + "/search"
+        params = ["q=%s" % q]
+        category = self.supported_categories.get(cat, "")
+        if category:
+            params.append("category=%s" % category)
+        if self.sort_param and self.sort_value:
+            params.append("%s=%s" % (self.sort_param, self.sort_value))
+        if self.page_param and page:
+            params.append("%s=%d" % (self.page_param, page))
+        return base + "?" + "&".join(params)
 
     def _search_page(self, what, cat, page):
         url = self._search_url(what, cat, page)
