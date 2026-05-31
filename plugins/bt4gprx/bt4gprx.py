@@ -1,4 +1,4 @@
-#VERSION: 3.00
+#VERSION: 2026.1
 # AUTHORS: (you)
 # LICENSING INFORMATION
 #
@@ -40,6 +40,10 @@
 #   BT4G_MIN_DELAY      min seconds between requests, default 1.5
 #   BT4G_MAX_DELAY      max seconds between requests, default 4.0
 #   BT4G_BASE_URL       override base URL if the domain/mirror changes
+#   BT4G_LOG_FILE       path for a tailable log (default /config/bt4gprx.log, then
+#                       /tmp/bt4gprx.log); set to "" to disable file logging
+#   BT4G_LOG_LEVEL      DEBUG | INFO | WARNING | ERROR | CRITICAL (default ERROR).
+#                       Use DEBUG for verbose tracing while testing.
 #   BT4G_UPDATE_TRACKERS  refresh trackers from ngosang/trackerslist at runtime;
 #                         "1" (default) on, "0" to use only the embedded snapshot
 #
@@ -56,6 +60,7 @@ import sys
 import json
 import time
 import random
+import logging
 from html.parser import HTMLParser
 from urllib.parse import urljoin, quote
 
@@ -113,10 +118,72 @@ _DEFAULT_TRACKERS = [
 _HASH_RE = re.compile(r"\b([A-Fa-f0-9]{40}|[A-Z2-7]{32})\b")
 _MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\"'<>\s]*")
 
+# Cloudflare origin-side error codes. When any of these come back, bt4g itself
+# (the origin) is the problem, not our request or the bypass.
+_CF_ORIGIN_ERRORS = {
+    520: "Web server returned an unknown error",
+    521: "Web server is down",
+    522: "Connection timed out",
+    523: "Origin is unreachable",
+    524: "A timeout occurred",
+    525: "SSL handshake failed",
+    526: "Invalid SSL certificate",
+    527: "Railgun error",
+}
 
-def _log(msg):
-    """All diagnostics go to stderr. stdout is reserved for results."""
-    print("[bt4gprx] %s" % msg, file=sys.stderr)
+# Where to write a persistent, tailable log. qBittorrent does not reliably forward
+# a search plugin's stderr to `docker logs`, so we also append here. Override with
+# BT4G_LOG_FILE; set it to "" to disable file logging. Default prefers /config
+# (the linuxserver persistent volume), then /tmp.
+def _default_log_file():
+    env = os.environ.get("BT4G_LOG_FILE")
+    if env is not None:
+        return env.strip()  # explicit override (may be "" to disable)
+    for d in ("/config", "/tmp"):
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return os.path.join(d, "bt4gprx.log")
+    return ""
+
+_LOG_FILE = _default_log_file()
+
+
+def _resolve_level():
+    """Read BT4G_LOG_LEVEL. Accepts level names (DEBUG/INFO/WARNING/ERROR/CRITICAL,
+    case-insensitive) or a numeric value. Defaults to ERROR for released use."""
+    raw = os.environ.get("BT4G_LOG_LEVEL", "ERROR").strip()
+    if not raw:
+        return logging.ERROR
+    if raw.isdigit():
+        return int(raw)
+    return getattr(logging, raw.upper(), logging.ERROR)
+
+
+def _build_logger():
+    """Configure the module logger once. Writes to stderr always, and to the
+    tailable logfile when writable. stdout is reserved for search results."""
+    lg = logging.getLogger("bt4gprx")
+    lg.setLevel(_resolve_level())
+    lg.propagate = False  # don't leak to the root logger / qBittorrent's stdout
+    if lg.handlers:       # already configured (engine re-instantiated) -> reuse
+        return lg
+    fmt = logging.Formatter(
+        "%(asctime)s [bt4gprx] %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    lg.addHandler(sh)
+    if _LOG_FILE:
+        try:
+            fh = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+            fh.setFormatter(fmt)
+            lg.addHandler(fh)
+        except Exception:
+            pass  # never let logging setup break a search
+    return lg
+
+
+log = _build_logger()
 
 
 class bt4gprx(object):
@@ -210,36 +277,70 @@ class bt4gprx(object):
             or "enable javascript and cookies" in needle
         )
 
+    @staticmethod
+    def _cf_error_in_body(html):
+        """If the page is a Cloudflare origin-error screen (e.g. 525), return the
+        numeric code, else None. Cloudflare error pages contain markup like
+        'Error 525' / 'cf-error-details' near a 5xx code."""
+        if not html:
+            return None
+        head = html[:6000].lower()
+        if "cloudflare" not in head and "cf-error" not in head and "error code" not in head:
+            return None
+        m = re.search(r"\berror[\s:]*?(52[0-7])\b", head)
+        if not m:
+            m = re.search(r"\b(52[0-7])\b", head)
+        return int(m.group(1)) if m else None
+
     # ---------------------------------------------------------------- fetching
     def _fetch(self, url, referer=None):
         """Return page HTML as str, or None on failure. Tries the best
         available transport and warns clearly if Cloudflare blocks us."""
         self._humanize_delay()
+        log.debug("fetch: %s (referer=%s)", url, referer)
 
         if self.flaresolverr:
-            html = self._fetch_flaresolverr(url)
+            log.debug("trying FlareSolverr at %s", self.flaresolverr)
+            html, status = self._fetch_flaresolverr(url)
+            log.debug("FlareSolverr -> status=%s, html_len=%s",
+                      status, len(html) if html else None)
+            site_down = self._report_status(status, "FlareSolverr")
             if html is not None:
+                # FlareSolverr sometimes reports 200 while the rendered page is
+                # actually a Cloudflare error screen; catch that from the body too.
+                if not site_down:
+                    code = self._cf_error_in_body(html)
+                    if code:
+                        log.error(
+                            "bt4g appears DOWN — Cloudflare error %d (%s) detected in "
+                            "page body via FlareSolverr; the origin site is failing.",
+                            code, _CF_ORIGIN_ERRORS.get(code, "origin error"),
+                        )
                 return html
-            _log("FlareSolverr fetch failed; falling back.")
+            log.info("FlareSolverr returned no content; falling back.")
 
         if cffi_requests is not None:
+            log.debug("trying curl_cffi (impersonate=%s)", self.impersonate)
             html, status = self._fetch_curl_cffi(url, referer)
+            log.debug("curl_cffi -> status=%s, html_len=%s",
+                      status, len(html) if html else None)
             if html is not None and not self._looks_like_challenge(html, status):
                 return html
-            _log(
+            log.warning(
                 "curl_cffi got a Cloudflare challenge (status=%s). For JS/Turnstile "
-                "challenges, run FlareSolverr and set BT4G_FLARESOLVERR." % status
+                "challenges, run FlareSolverr and set BT4G_FLARESOLVERR.", status
             )
             if html is not None:
                 return html  # hand back anyway; parser will simply find nothing
 
         # Last resort: stdlib. Almost always blocked while CF is on.
         if cffi_requests is None and not self.flaresolverr:
-            _log(
+            log.warning(
                 "curl_cffi is not installed and FlareSolverr is not configured. "
                 "Using urllib, which Cloudflare will likely block. Install with: "
                 "python3 -m pip install curl_cffi"
             )
+        log.debug("trying urllib (stdlib) for %s", url)
         return self._fetch_urllib(url, referer)
 
     def _get_session(self):
@@ -259,7 +360,7 @@ class bt4gprx(object):
             )
             return resp.text, resp.status_code
         except Exception as e:
-            _log("curl_cffi error: %s" % e)
+            log.warning("curl_cffi error: %s", e)
             return None, None
 
     def _fetch_urllib(self, url, referer):
@@ -269,14 +370,14 @@ class bt4gprx(object):
                 charset = r.headers.get_content_charset() or "utf-8"
                 return r.read().decode(charset, errors="replace")
         except urllib.error.HTTPError as e:
-            _log("urllib HTTP %s for %s" % (e.code, url))
+            log.warning("urllib HTTP %s for %s", e.code, url)
         except Exception as e:
-            _log("urllib error: %s" % e)
+            log.warning("urllib error: %s", e)
         return None
 
     def _fetch_flaresolverr(self, url):
         """Drive a FlareSolverr instance (headless browser) to clear CF and
-        return the rendered HTML."""
+        return (html, upstream_status). Returns (None, None) on transport error."""
         try:
             payload = {
                 "cmd": "request.get",
@@ -294,11 +395,43 @@ class bt4gprx(object):
             )
             with urllib.request.urlopen(req, timeout=90) as r:
                 body = json.loads(r.read().decode("utf-8", errors="replace"))
-            sol = body.get("solution") or {}
-            return sol.get("response")
         except Exception as e:
-            _log("FlareSolverr error: %s" % e)
-            return None
+            log.error("FlareSolverr unreachable at %s: %s", self.flaresolverr, e)
+            return None, None
+
+        # FlareSolverr itself reports a status string ("ok"/"error") plus a message.
+        if body.get("status") != "ok":
+            log.warning("FlareSolverr could not solve: %s", body.get("message", "unknown error"))
+        sol = body.get("solution") or {}
+        status = sol.get("status")  # the HTTP status bt4g/Cloudflare returned
+        return sol.get("response"), status
+
+    @staticmethod
+    def _report_status(status, source):
+        """Log a clear, human-readable line for a notable HTTP status. Returns
+        True if the status indicates the site (not us) is the problem."""
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            return False
+        if code in _CF_ORIGIN_ERRORS:
+            log.error(
+                "bt4g appears DOWN — Cloudflare error %d (%s) via %s. This is the "
+                "origin site failing, not the plugin or the bypass; try again later.",
+                code, _CF_ORIGIN_ERRORS[code], source,
+            )
+            return True
+        if code in (403, 429, 503):
+            log.warning("Cloudflare challenge/block: HTTP %d via %s.", code, source)
+            return True
+        if code >= 500:
+            log.error("Server error: HTTP %d via %s.", code, source)
+            return True
+        if code >= 400:
+            log.warning("HTTP %d via %s.", code, source)
+            return True
+        log.debug("HTTP %s via %s (ok).", code, source)
+        return False
 
     # ----------------------------------------------------------------- parsing
     class _ResultParser(HTMLParser):
@@ -364,14 +497,14 @@ class bt4gprx(object):
                 with urllib.request.urlopen(req, timeout=15) as r:
                     text = r.read().decode("utf-8", errors="replace")
         except Exception as e:
-            _log("tracker list refresh failed (%s); using embedded snapshot." % e)
+            log.info("tracker list refresh failed (%s); using embedded snapshot.", e)
             return
         fetched = [ln.strip() for ln in text.splitlines() if ln.strip()]
         # Only adopt it if it looks sane (a few real tracker URLs).
         fetched = [t for t in fetched if "://" in t]
         if len(fetched) >= 3:
             self._trackers = fetched
-            _log("loaded %d trackers from trackerslist." % len(fetched))
+            log.debug("loaded %d trackers from trackerslist.", len(fetched))
 
     def _build_magnet(self, info_hash, display_name=None):
         self._load_trackers()
@@ -410,18 +543,23 @@ class bt4gprx(object):
         url = self._search_url(what, cat, page)
         html = self._fetch(url, referer=self.url)
         if not html:
+            log.debug("page %d: no html returned", page)
             return []
         try:
-            return self._ResultParser().parse(html)
+            rows = self._ResultParser().parse(html)
+            log.debug("page %d: parsed %d row(s) from %d bytes", page, len(rows), len(html))
+            return rows
         except Exception as e:
-            _log("parse error on page %d: %s" % (page, e))
+            log.warning("parse error on page %d: %s", page, e)
             return []
 
     # DO NOT change the name/parameters of this function. nova2.py calls it.
     # `what` arrives already URL-escaped (e.g. "Big+Buck+Bunny").
     def search(self, what, cat="all"):
         if cat not in self.supported_categories:
+            log.debug("unknown category %r; using 'all'", cat)
             cat = "all"
+        log.debug("search start: what=%r cat=%r max_pages=%d", what, cat, self.max_pages)
 
         rows = []
         seen = set()
@@ -436,6 +574,7 @@ class bt4gprx(object):
                     seen.add(key)
                     rows.append(r)
                     new += 1
+            log.debug("page %d: %d new unique row(s) (total=%d)", page, new, len(rows))
             if new == 0:
                 break
 
@@ -447,6 +586,7 @@ class bt4gprx(object):
                 return -1
 
         rows.sort(key=lambda r: _to_int(r.get("seeders", -1)), reverse=True)
+        log.debug("search done: emitting %d result(s)", len(rows))
 
         for r in rows:
             href = r["href"]
@@ -457,8 +597,10 @@ class bt4gprx(object):
             info_hash = self._hash_from_href(href)
             if info_hash:
                 link = self._build_magnet(info_hash, r.get("title"))
+                log.debug("result %r: magnet from hash %s", r.get("title"), info_hash)
             else:
                 link = desc_link
+                log.debug("result %r: deferred magnet (desc page)", r.get("title"))
 
             prettyPrinter({
                 "link": link,
@@ -474,11 +616,12 @@ class bt4gprx(object):
     # Called by qBittorrent only when `link` was a description page (the slow
     # path above). Must PRINT the resolved magnet (or a file path) to stdout.
     def download_torrent(self, info):
+        log.debug("download_torrent: resolving %s", info)
         magnet = self._resolve_magnet(info)
         if magnet:
             print(magnet + " " + info)
         else:
-            _log("could not resolve a magnet from %s" % info)
+            log.error("could not resolve a magnet from %s", info)
 
 
 if __name__ == "__main__":
