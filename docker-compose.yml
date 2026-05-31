@@ -1,0 +1,75 @@
+services:
+  gluetun:
+    image: ghcr.io/qdm12/gluetun:latest  # Uses the latest Gluetun VPN image
+    mem_limit: 256M
+    #profiles: ["donotstart"]
+    container_name: gluetun  # Assigns a fixed name to the container for easy reference
+    restart: unless-stopped  # Ensures Gluetun restarts if it crashes
+    cap_add:
+      - NET_ADMIN  # Grants networking privileges required for VPN operation
+    devices:
+      - /dev/net/tun:/dev/net/tun  # Enables VPN tunneling inside the container
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1  # Disables IPv6 to prevent leaks
+    environment:
+      - VPN_SERVICE_PROVIDER=protonvpn  # Specifies ProtonVPN as the VPN provider
+      - VPN_TYPE=wireguard  # Uses WireGuard as the VPN protocol
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}  # Private key for authentication (from .env)
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES}  # Preferred VPN server country selection
+      - SERVER_CITIES=${SERVER_CITIES}  # (Optional) Restrict to a specific city
+      - VPN_PORT_FORWARDING=on  # Enables automatic port forwarding (needed for torrenting)
+      - TZ=${TZ}  # Sets the timezone for correct timestamps in logs
+      - QBT_WEBUI_ENABLED=true  # ✅ Ensures Web UI is always enabled
+    volumes:
+      - ${CONFIG}/gluetun:/gluetun  # Stores VPN configuration persistently
+      - ${CONFIG}/gluetun/auth/config.toml:/gluetun/auth/config.toml:ro # Stores AUTH endpoint for automatic API updates from GSM
+    ports:
+      - "8080:8080"  # ✅ Exposes qBittorrent Web UI to localhost
+      # - "8191:8191"  # (optional) expose FlareSolverr to the host for debugging
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://google.com"]  # Checks if the VPN connection is active
+      interval: 30s  # Runs every 30 seconds
+      timeout: 10s  # Fails if it takes longer than 10 seconds
+      retries: 2  # Allows 2 failures before marking the container as unhealthy
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest  # Uses the latest qBittorrent image
+    container_name: qbittorrent  # Assigns a fixed name to the container
+    mem_limit: 4G
+    #profiles: ["donotstart"]
+    restart: unless-stopped  # Ensures qBittorrent restarts if it crashes
+    network_mode: "service:gluetun"  # 🔒 Ensures qBittorrent ONLY works through the VPN (Prevents leaks)
+    depends_on:
+      gluetun:
+        condition: service_healthy  # Ensures qBittorrent starts only when the VPN is fully functional
+    environment:
+      - PUID=${PUID}  # User ID (ensures correct file permissions)
+      - PGID=${PGID}  # Group ID (ensures correct file ownership)
+      - TZ=${TZ}  # Timezone for logs and schedules
+      - WEBUI_PORT=8080  # Sets qBittorrent's Web UI to port 8080
+      - QBITTORRENT_INTERFACE=tun0  # 🔒 Forces all traffic through VPN interface
+      - DOCKER_MODS=ghcr.io/t-anc/gsp-qbittorent-gluetun-sync-port-mod:main
+      - GSP_GTN_API_KEY=${GSP_GTN_API_KEY:-randomapikey}  # API key for port forwarding updates
+      - GSP_QBITTORRENT_PORT=${GSP_QBITTORRENT_PORT:-53764}  # Torrenting port (auto-updated by Gluetun)
+      - GSP_MINIMAL_LOGS=false  # Enables full logs for debugging purposes
+      - BT4G_FLARESOLVERR=http://localhost:8191/v1  # 🔎 bt4gprx plugin → FlareSolverr (same netns via gluetun)
+    volumes:
+      - ${CONFIG}/config:/config   # Stores qBittorrent settings persistently
+      - ${CONFIG}/incomplete:/incomplete  # ⚡ Temporary download location (reduces SSD wear)
+      - ${CONFIG}/DONE:/downloads  # ✅ Completed torrents move here
+    ulimits:
+      nofile:
+        soft: 32768
+        hard: 65536  # Increases allowed open files (important for high-speed torrenting)
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest  # Headless-browser proxy that clears Cloudflare
+    container_name: flaresolverr  # Assigns a fixed name to the container
+    mem_limit: 1G  # Headless Chrome can be memory-hungry; cap it
+    shm_size: 1gb  # Give Chrome enough shared memory to avoid crashes
+    restart: unless-stopped  # Restart if it crashes
+    network_mode: "service:gluetun"  # 🔒 Same namespace as qBittorrent → reachable at localhost:8191, egresses via VPN
+    depends_on:
+      gluetun:
+        condition: service_healthy  # Start only once the VPN is up
+    environment:
+      - LOG_LEVEL=info  # FlareSolverr log verbosity
+      - TZ=${TZ}  # Timezone for logs
