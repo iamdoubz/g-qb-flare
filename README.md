@@ -1,27 +1,29 @@
-# bt4gprx.com — qBittorrent Search Plugin
+# qBittorrent Search Plugin — bt4gprx
 
 A qBittorrent search-engine plugin for [bt4gprx.com](https://bt4gprx.com), a DHT
-torrent index. It is written for **Python 3.12** and is designed to get past the
-site's **Cloudflare** protection by "acting like a human": it reuses a single
-session (so the `cf_clearance` cookie persists), sends a full browser header set,
-spaces requests out with randomized delays, and can drive a real headless browser
-(FlareSolverr) to clear JavaScript/Turnstile challenges.
+torrent index. Written for **Python 3.12**, it gets past the site's **Cloudflare**
+protection by "acting like a human": it reuses a single session (so the
+`cf_clearance` cookie persists), sends a full browser header set, spaces requests
+out with randomized delays, and can drive a real anti-detection browser
+(**Byparr**) to clear JavaScript / Turnstile challenges.
 
 Features:
 
 - Free-text search across the whole site.
 - **Category-focused search** — qBittorrent's categories are mapped onto bt4g's
-  buckets (movies, tv, anime, music, books, software, games, pictures, all).
+  buckets (all, video, audio, doc, app, other).
 - **Cloudflare-resistant fetching** with three transports, tried in order:
-  FlareSolverr → `curl_cffi` (TLS impersonation) → stdlib `urllib`.
+  Byparr (solver) → `curl_cffi` (TLS impersonation) → stdlib `urllib`.
+- **Manual-cookie fallback** — paste a solved `cf_clearance` to bypass the solver.
 - **Auto-updating trackers** — magnets are populated from
   [ngosang/trackerslist](https://github.com/ngosang/trackerslist)
-  (`trackers_best.txt`), refreshed live at runtime with a baked-in offline fallback.
+  (`trackers_best.txt`), refreshed live with a baked-in offline fallback.
+- **Leveled logging** to a tailable file for easy debugging.
 
 > **Note on the official repo.** Official qBittorrent search plugins are expected
 > to use only the Python standard library. Because bt4gprx.com is behind
-> Cloudflare, this plugin relies on extra tooling (FlareSolverr and/or
-> `curl_cffi`), so it is **not** eligible for the official plugin repository.
+> Cloudflare, this plugin relies on extra tooling (Byparr and/or `curl_cffi`), so
+> it is **not** eligible for the official plugin repository.
 
 ---
 
@@ -34,7 +36,9 @@ Features:
 5. [Using the plugin](#using-the-plugin)
 6. [Environment variables](#environment-variables)
 7. [Category mapping](#category-mapping)
-8. [Troubleshooting](#troubleshooting)
+8. [Search URL format](#search-url-format)
+9. [Debugging](#debugging)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -43,12 +47,13 @@ Features:
 - qBittorrent with the **Search** tab enabled and a working Python interpreter.
 - One of the following for Cloudflare (the plugin still loads without them, but
   will be blocked while Cloudflare is active):
-  - **FlareSolverr** running as a reachable service *(recommended for Docker)*, **or**
-  - the **`curl_cffi`** Python package installed in the *same* Python that
-    qBittorrent uses for search.
+  - **Byparr** running as a reachable service *(recommended for Docker)*, **or**
+  - the **`curl_cffi`** package installed in the *same* Python qBittorrent uses
+    for search, **or**
+  - a manually pasted `cf_clearance` cookie (see `BT4G_CF_CLEARANCE`).
 
-The Docker Compose setup below uses the FlareSolverr route, which means the
-qBittorrent container needs **no third-party Python packages at all**.
+The Docker Compose setup below uses the Byparr route, which means the qBittorrent
+container needs **no third-party Python packages at all**.
 
 ---
 
@@ -57,32 +62,38 @@ qBittorrent container needs **no third-party Python packages at all**.
 When the plugin fetches a page it tries these transports in order and uses the
 first that returns usable HTML:
 
-1. **FlareSolverr** — only if `BT4G_FLARESOLVERR` is set. Runs a real headless
-   browser, so it can clear actual JS / Turnstile challenges. Most human-like,
-   heaviest. Uses only the standard library to talk to FlareSolverr.
-2. **`curl_cffi`** — TLS / JA3 browser impersonation. Lightweight and fast, and
-   clears Cloudflare when detection is fingerprint-based (the common case). This
-   is the default when FlareSolverr is not configured.
-3. **`urllib`** (stdlib) — fallback so the plugin still works if Cloudflare is
-   off. Usually blocked while Cloudflare is active.
+1. **Byparr** — only if `BT4G_BYPARR` (or the legacy `BT4G_FLARESOLVERR`) is set.
+   A maintained, FlareSolverr-compatible solver that runs a real anti-detection
+   browser, so it clears modern Cloudflare "Just a moment" / Turnstile challenges
+   that FlareSolverr no longer can. Most human-like, heaviest. Uses only the
+   standard library to talk to the solver.
+2. **`curl_cffi`** — TLS / JA3 browser impersonation. Lightweight and fast; clears
+   Cloudflare when detection is fingerprint-based. Used when no solver is set, and
+   always for the tracker-list refresh.
+3. **`urllib`** (stdlib) — fallback so the plugin still works if Cloudflare is off.
+   Usually blocked while Cloudflare is active.
 
-The tracker-list refresh always uses `curl_cffi` if present, otherwise `urllib`
-(GitHub's raw host is not behind Cloudflare).
+If `BT4G_CF_CLEARANCE` (or `BT4G_COOKIE`) is set, the plugin **skips the solver**
+and sends the cookie on the direct (`curl_cffi`/`urllib`) requests instead.
+
+> **Why Byparr, not FlareSolverr?** FlareSolverr can no longer solve Cloudflare's
+> current managed-challenge / Turnstile pages and times out (HTTP 500, "Error
+> solving the challenge"). Byparr speaks the same `/v1` API, so it is a drop-in
+> replacement — no plugin change is needed to switch.
 
 ---
 
 ## Docker Compose setup
 
-This example runs qBittorrent behind a **Gluetun** VPN and adds **FlareSolverr**
-in the *same network namespace* so the two can talk over `localhost`.
+This example runs qBittorrent behind a **Gluetun** VPN and adds **Byparr** in the
+*same network namespace* so the two can talk over `localhost`.
 
-> **Why the same namespace?** qBittorrent uses
-> `network_mode: "service:gluetun"`, so it shares Gluetun's network stack. Placing
-> FlareSolverr in that same namespace lets qBittorrent reach it at
-> `http://localhost:8191/v1` with no extra firewall rules, and FlareSolverr's
-> traffic also egresses through the VPN. If you instead put FlareSolverr on a
-> normal bridge network, Gluetun's killswitch will block qBittorrent from reaching
-> it unless you add your Docker subnet to `FIREWALL_OUTBOUND_SUBNETS`.
+> **Why the same namespace?** qBittorrent uses `network_mode: "service:gluetun"`,
+> so it shares Gluetun's network stack. Placing Byparr in that same namespace lets
+> qBittorrent reach it at `http://localhost:8191/v1` with no extra firewall rules,
+> and Byparr's traffic also egresses through the VPN. If you instead put Byparr on
+> a normal bridge network, Gluetun's killswitch will block qBittorrent from
+> reaching it unless you add your Docker subnet to `FIREWALL_OUTBOUND_SUBNETS`.
 
 ### `docker-compose.yml`
 
@@ -113,7 +124,7 @@ services:
       - ${CONFIG}/gluetun/auth/config.toml:/gluetun/auth/config.toml:ro
     ports:
       - "8080:8080"          # qBittorrent Web UI
-      # - "8191:8191"        # (optional) expose FlareSolverr to the host for debugging
+      # - "8191:8191"        # (optional) expose Byparr to the host for debugging
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://google.com"]
       interval: 30s
@@ -139,7 +150,7 @@ services:
       - GSP_GTN_API_KEY=${GSP_GTN_API_KEY:-randomapikey}
       - GSP_QBITTORRENT_PORT=${GSP_QBITTORRENT_PORT:-53764}
       - GSP_MINIMAL_LOGS=false
-      - BT4G_FLARESOLVERR=http://localhost:8191/v1   # bt4gprx plugin → FlareSolverr
+      - BT4G_BYPARR=http://localhost:8191/v1   # bt4gprx plugin -> Byparr
     volumes:
       - ${CONFIG}/config:/config
       - ${CONFIG}/incomplete:/incomplete
@@ -149,24 +160,21 @@ services:
         soft: 32768
         hard: 65536
 
-  flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    container_name: flaresolverr
-    mem_limit: 1G
-    shm_size: 1gb                        # headless Chrome needs more than the 64MB default
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: byparr
+    mem_limit: 2G                        # anti-detection browser is memory-hungry
+    shm_size: 2gb                        # headless Chrome needs more than 64MB
     restart: unless-stopped
-    network_mode: "service:gluetun"      # same namespace → reachable at localhost:8191
+    network_mode: "service:gluetun"      # same namespace -> reachable at localhost:8191
     depends_on:
       gluetun:
         condition: service_healthy
     environment:
-      - LOG_LEVEL=info
       - TZ=${TZ}
 ```
 
 ### `.env`
-
-The compose file expects these variables (adjust to your setup):
 
 ```dotenv
 CONFIG=/path/to/your/config
@@ -186,21 +194,24 @@ GSP_QBITTORRENT_PORT=53764
 docker compose up -d
 ```
 
-Gluetun comes up first; qBittorrent and FlareSolverr start once the VPN is
-healthy. The qBittorrent Web UI is at `http://<host>:8080`.
+Gluetun comes up first; qBittorrent and Byparr start once the VPN is healthy. The
+Web UI is at `http://<host>:8080`.
 
-> **Important:** `BT4G_FLARESOLVERR` must be `http://localhost:8191/v1` here —
-> **not** `http://flaresolverr:8191`. Because the containers share Gluetun's
-> network stack, the service name will not resolve from inside the namespace, but
-> `localhost` points at the shared stack.
+> **Important:** `BT4G_BYPARR` must be `http://localhost:8191/v1` here — **not**
+> `http://byparr:8191`. Because the containers share Gluetun's network stack, the
+> service name will not resolve from inside the namespace, but `localhost` points
+> at the shared stack.
+
+> **VPN caveat:** Byparr's challenge-solving requests exit through your VPN IP.
+> Datacenter/VPN IPs draw Cloudflare challenges more often than residential ones,
+> so a solve may occasionally be slow or need a retry.
 
 ---
 
 ## Installing the plugin
 
-The plugin file (`plugins/bt4gprx/bt4gprx.py`) must be installed into qBittorrent. The cleanest
-way is through the Web UI, which copies it into the correct engines directory and
-persists it in your `/config` volume:
+Install through the Web UI, which copies the file into the correct engines
+directory and persists it in your `/config` volume:
 
 1. Open the qBittorrent Web UI (`http://<host>:8080`).
 2. Go to the **Search** tab. If it is missing, enable it under
@@ -210,17 +221,10 @@ persists it in your `/config` volume:
    **Local file** and point to a path reachable inside the container.
 5. Confirm `bt4gprx` appears in the plugin list and is enabled.
 
-To update later, use **Check for updates** or **Uninstall** then reinstall.
-
 ### Alternative: install by file path
 
-If you prefer to drop the file in manually, copy it into the search engines
-directory inside the container's config volume (do **not** hand-place it unless
-the Web UI method is unavailable — the exact path can vary by version):
-
 ```bash
-docker cp plugins/bt4gprx/bt4gprx.py qbittorrent:/config/qBittorrent/nova3/engines/bt4gprx.py
-# then restart qBittorrent so it picks up the new engine
+docker cp bt4gprx.py qbittorrent:/config/qBittorrent/nova3/engines/bt4gprx.py
 docker restart qbittorrent
 ```
 
@@ -230,20 +234,26 @@ docker restart qbittorrent
 
 1. Open the **Search** tab in the qBittorrent Web UI.
 2. Type your search terms.
-3. Pick a **category** from the dropdown to focus the search, or leave it on
-   **All categories**.
+3. Pick a **category** to focus the search, or leave it on **All categories**.
 4. Run the search. Results are sorted with the most seeders first.
-5. Double-click a result (or use the download button) to add it. Magnets are
-   built with an up-to-date public tracker list.
+5. Double-click a result (or use the download button) to add it.
+
+> **Download timing:** bt4g's search results link to detail pages, not directly to
+> magnets. When you download a result, the plugin fetches its detail page (through
+> Byparr) to extract the real infohash, then builds the magnet locally with the
+> tracker list. Expect a ~30-second pause for that one fetch — it's Byparr clearing
+> Cloudflare, not a hang. It happens once per download, only for the item you grab.
+> The external link hosts (downloadtorrentfile.com / keepshare.org) are never
+> contacted; only the infohash is read from the page.
 
 ### Testing outside qBittorrent
 
-You can run the bundled `nova2.py` harness from within the container to verify the
-engine works before relying on it in the UI:
+From inside the container, you can run the bundled `nova2.py` harness:
 
 ```bash
+cd /config/qBittorrent/nova3
 python3 nova2.py bt4gprx all ubuntu
-python3 nova2.py bt4gprx movies "big buck bunny"
+python3 nova2.py bt4gprx tv "frieren season 2"
 ```
 
 Each result is one `|`-separated line:
@@ -253,81 +263,143 @@ Each result is one `|`-separated line:
 
 ## Environment variables
 
-All variables are **optional** and read by the plugin at runtime. Set them on the
-container that runs qBittorrent's search (in the Compose example, the
-`qbittorrent` service).
+All variables are **optional**. Set them on the container that runs qBittorrent's
+search (the `qbittorrent` service in the Compose example).
 
 | Variable | Default | Description |
 |---|---|---|
-| `BT4G_FLARESOLVERR` | *(empty)* | FlareSolverr endpoint, e.g. `http://localhost:8191/v1`. When set, the plugin prefers FlareSolverr (real headless browser) to clear Cloudflare. Leave empty to skip FlareSolverr. |
-| `BT4G_IMPERSONATE` | `chrome` | `curl_cffi` impersonation target (e.g. `chrome`, `chrome124`, `safari17`). Controls the browser TLS/JA3 fingerprint used by the lightweight transport. |
-| `BT4G_UPDATE_TRACKERS` | `1` | Refresh the tracker list from ngosang/trackerslist at runtime. Set to `0` (also accepts `false`/`no`) to use only the embedded snapshot baked into the plugin. |
-| `BT4G_MAX_PAGES` | `3` | Maximum number of result pages to walk per search. Higher = more results but more requests. Minimum effective value is `1`. |
-| `BT4G_MIN_DELAY` | `1.5` | Minimum seconds to wait between requests (lower bound of the randomized human-like delay). |
-| `BT4G_MAX_DELAY` | `4.0` | Maximum seconds to wait between requests (upper bound of the randomized human-like delay). |
+| `BT4G_BYPARR` | *(empty)* | Byparr (or FlareSolverr) endpoint, e.g. `http://localhost:8191/v1`. When set, the plugin prefers the solver to clear Cloudflare. |
+| `BT4G_FLARESOLVERR` | *(empty)* | Legacy alias for `BT4G_BYPARR` (same effect). `BT4G_BYPARR` takes precedence if both are set. |
+| `BT4G_FS_TIMEOUT_MS` | `60000` | Solver `maxTimeout` in milliseconds. Raise it if the solver needs longer to clear a challenge. |
+| `BT4G_CF_CLEARANCE` | *(empty)* | Manually solved Cloudflare `cf_clearance` cookie value. When set, the plugin skips the solver and sends this cookie on direct requests. Bound to IP + User-Agent + TLS fingerprint and expires (~30 min); solve from the same exit IP and set `BT4G_USER_AGENT` to match. `curl_cffi` strongly recommended (its browser TLS fingerprint helps the cookie pass). |
+| `BT4G_COOKIE` | *(empty)* | Full raw `Cookie` header to send instead (overrides `BT4G_CF_CLEARANCE`). |
+| `BT4G_USER_AGENT` | Chrome 124 UA | User-Agent to send; MUST match the browser that solved the challenge when using `BT4G_CF_CLEARANCE`. |
+| `BT4G_IMPERSONATE` | `chrome` | `curl_cffi` impersonation target (e.g. `chrome`, `chrome124`, `safari17`). |
+| `BT4G_UPDATE_TRACKERS` | `1` | Refresh the tracker list from ngosang/trackerslist at runtime. Set to `0` (also `false`/`no`) to use only the embedded snapshot. |
+| `BT4G_MAX_PAGES` | `3` | Maximum number of result pages to walk per search (minimum effective value `1`). |
+| `BT4G_MIN_DELAY` | `1.5` | Minimum seconds between requests (lower bound of the randomized human-like delay). |
+| `BT4G_MAX_DELAY` | `4.0` | Maximum seconds between requests (upper bound of the delay). |
 | `BT4G_BASE_URL` | `https://bt4gprx.com` | Override the site base URL if the domain changes or you use a mirror. |
-
-### Notes on values
-
-- **`BT4G_MIN_DELAY` / `BT4G_MAX_DELAY`** are the randomized inter-request pause.
-  Keeping a spread (rather than a fixed interval) is part of the human-like
-  behavior; do not set them to `0` unless you are testing.
-- **`BT4G_MAX_PAGES`** is clamped to at least `1`. Bad numeric values fall back to
-  the default.
-- **`BT4G_FLARESOLVERR`** must point at the `/v1` endpoint of a reachable
-  FlareSolverr instance. In the VPN/namespace setup above this is
-  `http://localhost:8191/v1`.
+| `BT4G_PAGE_PARAM` | `p` | Query param name for pagination. Set to `""` to disable paging (single page). |
+| `BT4G_SORT_PARAM` | `orderby` | Query param name for sorting. Set to `""` to drop sorting (site default order). |
+| `BT4G_SORT_VALUE` | `seeders` | Value for the sort param. |
+| `BT4G_LOG_LEVEL` | `ERROR` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` (case-insensitive) or numeric. Use `DEBUG` for verbose tracing while testing. |
+| `BT4G_LOG_FILE` | `/config/bt4gprx.log` (then `/tmp/bt4gprx.log`) | Path for a tailable log. Set to `""` to disable file logging. |
 
 ---
 
 ## Category mapping
 
-qBittorrent has a fixed set of categories. bt4g groups content more coarsely, so
-several qBittorrent categories map onto the same bt4g bucket:
+qBittorrent has a fixed set of categories. bt4g groups content more coarsely
+(valid values: `all`, `video`, `audio`, `doc`, `app`, `other`), so several
+qBittorrent categories map onto the same bt4g bucket:
 
-| qBittorrent category | bt4g bucket |
+| qBittorrent category | bt4g `category=` value |
 |---|---|
-| All | *(everything)* |
-| Movies | movie |
-| TV | movie *(bt4g has no separate TV bucket)* |
-| Anime | movie |
-| Music | audio |
-| Books | doc |
-| Software | app |
-| Games | app |
-| Pictures | *(everything — no dedicated image bucket)* |
+| All | `all` |
+| Movies | `video` |
+| TV | `video` *(bt4g has no separate TV bucket)* |
+| Anime | `video` |
+| Music | `audio` |
+| Books | `doc` |
+| Software | `app` |
+| Games | `app` |
+| Pictures | `other` |
 
-If bt4g adds or changes categories, edit the `supported_categories` dictionary in
+If bt4g changes its categories, edit the `supported_categories` dictionary in
 `bt4gprx.py`.
+
+---
+
+## Search URL format
+
+The plugin builds URLs in this confirmed format:
+
+```
+https://bt4gprx.com/search?q=<term>&category=<cat>&orderby=seeders&p=<page>
+```
+
+- Spaces in the term are encoded as `%20`.
+- `category` is always sent, including `category=all` for "All categories".
+- `orderby` and `p` are configurable/removable via the env vars above.
+
+Example (TV category, page 1):
+
+```
+https://bt4gprx.com/search?q=frieren%20season%202&category=video&orderby=seeders&p=1
+```
+
+---
+
+## Debugging
+
+The plugin writes diagnostics to a tailable logfile (default `/config/bt4gprx.log`)
+as well as stderr. To debug a search:
+
+```bash
+# Set DEBUG on the qbittorrent service, recreate, then:
+docker exec -it qbittorrent tail -f /config/bt4gprx.log
+```
+
+At `DEBUG` you see the full lifecycle: URL fetched, which transport ran and the
+status/byte-length it returned, rows parsed per page, and how each magnet was
+resolved. To run a search manually inside the container:
+
+```bash
+cd /config/qBittorrent/nova3
+python3 nova2.py bt4gprx all ubuntu
+```
+
+To capture the exact HTML the plugin sees (through Byparr), POST to the solver:
+
+```bash
+docker exec -it qbittorrent python3 - <<'PY'
+import json, urllib.request
+payload = {"cmd":"request.get",
+           "url":"https://bt4gprx.com/search?q=frieren&category=all&orderby=seeders&p=1",
+           "maxTimeout":60000}
+req = urllib.request.Request("http://localhost:8191/v1",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type":"application/json"}, method="POST")
+html = json.loads(urllib.request.urlopen(req, timeout=90).read())["solution"]["response"]
+open("/config/bt4g_sample.html","w").write(html)
+print("saved", len(html), "bytes")
+PY
+docker cp qbittorrent:/config/bt4g_sample.html ./bt4g_sample.html
+```
 
 ---
 
 ## Troubleshooting
 
 **No results at all / every search is empty.**
-Cloudflare is probably blocking the fetch. Make sure `BT4G_FLARESOLVERR` is set
-and FlareSolverr is healthy, or install `curl_cffi`. Check the search engine logs
-for `[bt4gprx]` messages.
+Make sure `BT4G_BYPARR` is set and Byparr is healthy, or install `curl_cffi`, or
+paste a `BT4G_CF_CLEARANCE`. Check the log for `[bt4gprx]` lines.
 
-**`curl_cffi is not installed and FlareSolverr is not configured`.**
-You are on the stdlib-only path, which Cloudflare blocks. Configure FlareSolverr
-(recommended) or install `curl_cffi` in qBittorrent's Python.
+**Log says "Solver could not clear Cloudflare … challenge timeout".**
+The solver reached the site but failed the challenge. If you are still on legacy
+FlareSolverr, switch to Byparr (it handles modern challenges). Behind a VPN, a
+residential proxy on the solver may also be needed.
 
-**FlareSolverr errors or timeouts.**
+**Log says "Solver unreachable".**
 Confirm the URL is `http://localhost:8191/v1` in the namespace setup (not the
-service name). Check `docker logs flaresolverr`. Headless Chrome can crash with a
-small `/dev/shm`; the compose file sets `shm_size: 1gb` to avoid this.
+service name), and check `docker logs byparr`. Headless Chrome can crash with a
+small `/dev/shm`; the compose file sets `shm_size: 2gb`.
 
-**Searches are slow or occasionally fail through the VPN.**
-FlareSolverr's requests exit through your VPN IP, and datacenter/VPN IPs draw
-Cloudflare challenges more often than residential ones. Retrying usually works; a
-different VPN endpoint may help.
+**Log says "bt4g appears DOWN — Cloudflare error 5xx".**
+This is the origin site failing (e.g. 525 = SSL handshake failed), not the plugin
+or the solver. Try again later.
+
+**A download does nothing / "result may have been removed".**
+The detail page had no infohash — the torrent was likely removed from bt4g. The
+log line names the page. Try another result.
+
+**Searches are slow.**
+Each search walks up to `BT4G_MAX_PAGES` pages with a randomized 1.5–4s delay
+between requests, and each *download* triggers one detail-page solve (~30s). Lower
+`BT4G_MAX_PAGES` / the delays while testing if needed.
 
 **The site changed its HTML and parsing broke.**
-The page layout is handled in two places in `bt4gprx.py`: the `_search_url()`
-method (URL scheme) and the `_ResultParser` class (result markup). Update those if
-bt4g changes its site structure.
-
-**Plugin doesn't appear after install.**
-Ensure the Search tab is enabled (**View → Search Engine**) and that the image has
-a Python interpreter. Restart qBittorrent after manual file installs.
+The layout is handled in two places in `bt4gprx.py`: `_search_url()` (URL scheme)
+and the `_ResultParser` class (result markup). The magnet resolution lives in
+`_resolve_magnet()`. Update those if bt4g changes its structure.
