@@ -1,4 +1,4 @@
-#VERSION: 1.04
+#VERSION: 1.05
 # AUTHORS: iamdoubz
 # LICENSING INFORMATION
 #
@@ -224,13 +224,13 @@ class bt4gprx(object):
     name = "bt4gprx"
 
     # qBittorrent's fixed categories mapped onto bt4g's `category=` query values.
-    # bt4g's valid categories are: all, video, audio, doc, app, other. "all" is
+    # bt4g's valid categories are: all, movie, audio, doc, app, other. "all" is
     # sent explicitly as category=all (rather than omitting the param).
     supported_categories = {
         "all": "all",
-        "movies": "video",
-        "tv": "video",        # bt4g has no separate TV bucket
-        "anime": "video",
+        "movies": "movie",
+        "tv": "movie",        # bt4g has no separate TV bucket
+        "anime": "movie",
         "music": "audio",
         "books": "doc",
         "software": "app",
