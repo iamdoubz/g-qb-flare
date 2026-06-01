@@ -20,21 +20,26 @@
 #
 # FETCH STRATEGY (tried in this order)
 # ------------------------------------
-#   1. Byparr  - only if you opt in via env var BT4G_FLARESOLVERR (e.g.
-#                      http://localhost:8191/v1). Runs a headless browser, so it
-#                      can clear actual JS / Turnstile challenges. Most human-like,
-#                      heaviest. Run it with Docker:
-#                        docker run -d --name flaresolverr -p 8191:8191 \
-#                          --restart unless-stopped ghcr.io/thephaseless/byparr:latest
-#   2. curl_cffi     - TLS/JA3 browser impersonation. Lightweight, fast, and clears
-#                      Cloudflare when detection is fingerprint-based (the common
-#                      case). This is the default.
-#   3. urllib        - stdlib fallback so the plugin still loads/works if Cloudflare
-#                      is disabled. Will usually be blocked while CF is active.
+#   1. Byparr       - a maintained, FlareSolverr-compatible solver (same /v1 API).
+#                     Opt in via env var BT4G_BYPARR (e.g. http://localhost:8191/v1).
+#                     Runs a real anti-detection browser, so it clears modern
+#                     Cloudflare "Just a moment" / Turnstile challenges that
+#                     FlareSolverr no longer can. Most human-like, heaviest. Docker:
+#                       docker run -d --name byparr -p 8191:8191 \
+#                         --shm-size=2g --restart unless-stopped \
+#                         ghcr.io/thephaseless/byparr:latest
+#                     (Legacy FlareSolverr also works via the same setting; the env
+#                     var BT4G_FLARESOLVERR is still accepted as an alias.)
+#   2. curl_cffi    - TLS/JA3 browser impersonation. Lightweight, fast, and clears
+#                     Cloudflare when detection is fingerprint-based. Fallback when
+#                     no solver is configured; also used for the tracker-list fetch.
+#   3. urllib       - stdlib fallback so the plugin still loads/works if Cloudflare
+#                     is disabled. Will usually be blocked while CF is active.
 #
 # OPTIONAL ENVIRONMENT VARIABLES
 # ------------------------------
-#   BT4G_FLARESOLVERR   Byparr endpoint, e.g. http://localhost:8191/v1
+#   BT4G_BYPARR         Byparr (or FlareSolverr) endpoint, e.g. http://localhost:8191/v1
+#   BT4G_FLARESOLVERR   legacy alias for BT4G_BYPARR (same effect)
 #   BT4G_FS_TIMEOUT_MS  solver maxTimeout in milliseconds, default 60000
 #   BT4G_CF_CLEARANCE   manually solved Cloudflare cf_clearance cookie value. When
 #                       set, the plugin skips the solver and sends this cookie on
@@ -234,7 +239,12 @@ class bt4gprx(object):
     }
 
     def __init__(self):
-        self.flaresolverr = os.environ.get("BT4G_FLARESOLVERR", "").strip()
+        # Solver endpoint: prefer BT4G_BYPARR, fall back to the legacy
+        # BT4G_FLARESOLVERR alias. Both speak the same /v1 API.
+        self.solver_url = (
+            os.environ.get("BT4G_BYPARR", "").strip()
+            or os.environ.get("BT4G_FLARESOLVERR", "").strip()
+        )
         self.impersonate = os.environ.get("BT4G_IMPERSONATE", "chrome").strip() or "chrome"
         self.max_pages = self._int_env("BT4G_MAX_PAGES", 3)
         self.min_delay = self._float_env("BT4G_MIN_DELAY", 1.5)
@@ -268,7 +278,7 @@ class bt4gprx(object):
         else:
             self.cookie = ""
         self._session = None          # lazy curl_cffi session (keeps cf_clearance)
-        self._fs_session = None       # lazy FlareSolverr session id
+        self._solver_session = None   # lazy solver (Byparr/FlareSolverr) session id
         self._trackers = list(_DEFAULT_TRACKERS)
         self._update_trackers = os.environ.get("BT4G_UPDATE_TRACKERS", "1").strip() not in ("0", "false", "no", "")
         self._trackers_loaded = False
@@ -354,31 +364,31 @@ class bt4gprx(object):
         log.debug("fetch: %s (referer=%s)", url, referer)
 
         # A manually pasted cf_clearance cookie only works on the direct transports
-        # (curl_cffi / urllib) that send it — FlareSolverr uses its own browser
-        # session and ignores it. So when a cookie is set, skip FlareSolverr.
-        use_flaresolverr = self.flaresolverr and not self.cookie
-        if self.flaresolverr and self.cookie:
-            log.debug("manual cookie set; skipping FlareSolverr and using direct path")
+        # (curl_cffi / urllib) that send it — the solver uses its own browser
+        # session and ignores it. So when a cookie is set, skip the solver.
+        use_solver = self.solver_url and not self.cookie
+        if self.solver_url and self.cookie:
+            log.debug("manual cookie set; skipping solver and using direct path")
 
-        if use_flaresolverr:
-            log.debug("trying FlareSolverr at %s", self.flaresolverr)
-            html, status = self._fetch_flaresolverr(url)
-            log.debug("FlareSolverr -> status=%s, html_len=%s",
+        if use_solver:
+            log.debug("trying solver at %s", self.solver_url)
+            html, status = self._fetch_solver(url)
+            log.debug("solver -> status=%s, html_len=%s",
                       status, len(html) if html else None)
-            site_down = self._report_status(status, "FlareSolverr")
+            site_down = self._report_status(status, "solver")
             if html is not None:
-                # FlareSolverr sometimes reports 200 while the rendered page is
+                # The solver sometimes reports 200 while the rendered page is
                 # actually a Cloudflare error screen; catch that from the body too.
                 if not site_down:
                     code = self._cf_error_in_body(html)
                     if code:
                         log.error(
                             "bt4g appears DOWN — Cloudflare error %d (%s) detected in "
-                            "page body via FlareSolverr; the origin site is failing.",
+                            "page body via solver; the origin site is failing.",
                             code, _CF_ORIGIN_ERRORS.get(code, "origin error"),
                         )
                 return html
-            log.info("FlareSolverr returned no content; falling back.")
+            log.info("solver returned no content; falling back.")
 
         if cffi_requests is not None:
             log.debug("trying curl_cffi (impersonate=%s, cookie=%s)",
@@ -399,16 +409,16 @@ class bt4gprx(object):
             else:
                 log.warning(
                     "curl_cffi got a Cloudflare challenge (status=%s). For JS/Turnstile "
-                    "challenges, run a solver (Byparr/FlareSolverr) and set "
-                    "BT4G_FLARESOLVERR, or paste a fresh BT4G_CF_CLEARANCE.", status
+                    "challenges, run Byparr and set BT4G_BYPARR, or paste a fresh "
+                    "BT4G_CF_CLEARANCE.", status
                 )
             if html is not None:
                 return html  # hand back anyway; parser will simply find nothing
 
         # Last resort: stdlib. Almost always blocked while CF is on.
-        if cffi_requests is None and not self.flaresolverr:
+        if cffi_requests is None and not self.solver_url:
             log.warning(
-                "curl_cffi is not installed and FlareSolverr is not configured. "
+                "curl_cffi is not installed and no solver is configured. "
                 "Using urllib, which Cloudflare will likely block. Install with: "
                 "python3 -m pip install curl_cffi"
             )
@@ -447,9 +457,9 @@ class bt4gprx(object):
             log.warning("urllib error: %s", e)
         return None
 
-    def _fetch_flaresolverr(self, url):
-        """Drive a FlareSolverr-compatible solver (FlareSolverr, Byparr, ...) to
-        clear CF and return (html, upstream_status). Returns (None, None) on a
+    def _fetch_solver(self, url):
+        """Drive a FlareSolverr-compatible solver (Byparr or legacy FlareSolverr)
+        to clear CF and return (html, upstream_status). Returns (None, None) on a
         transport error. A solver that *reached us* but failed to solve the
         challenge (HTTP 500 with a JSON message) is reported distinctly so the
         log makes clear the problem is the solver/challenge, not connectivity."""
@@ -461,11 +471,11 @@ class bt4gprx(object):
                 "url": url,
                 "maxTimeout": timeout_ms,
             }
-            if self._fs_session:
-                payload["session"] = self._fs_session
+            if self._solver_session:
+                payload["session"] = self._solver_session
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
-                self.flaresolverr,
+                self.solver_url,
                 data=data,
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -487,18 +497,18 @@ class bt4gprx(object):
             if "challenge" in detail.lower() or "timeout" in detail.lower():
                 log.error(
                     "Solver could not clear Cloudflare for %s (HTTP %s): %s "
-                    "FlareSolverr struggles with modern 'Just a moment' / Turnstile "
-                    "challenges; consider a maintained solver (e.g. Byparr) or a "
-                    "residential proxy.", url, e.code, detail or "(no detail)",
+                    "If using legacy FlareSolverr, it struggles with modern 'Just a "
+                    "moment' / Turnstile challenges; switch to Byparr (BT4G_BYPARR) "
+                    "or add a residential proxy.", url, e.code, detail or "(no detail)",
                 )
             else:
-                log.error("Solver HTTP %s at %s: %s", e.code, self.flaresolverr, detail or e)
+                log.error("Solver HTTP %s at %s: %s", e.code, self.solver_url, detail or e)
             return None, None
         except Exception as e:
-            log.error("Solver unreachable at %s: %s", self.flaresolverr, e)
+            log.error("Solver unreachable at %s: %s", self.solver_url, e)
             return None, None
 
-        # FlareSolverr itself reports a status string ("ok"/"error") plus a message.
+        # The solver reports a status string ("ok"/"error") plus a message.
         if body.get("status") != "ok":
             log.warning("Solver did not return ok: %s", body.get("message", "unknown error"))
         sol = body.get("solution") or {}
