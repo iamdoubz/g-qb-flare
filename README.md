@@ -97,101 +97,18 @@ This example runs qBittorrent behind a **Gluetun** VPN and adds **Byparr** in th
 
 ### `docker-compose.yml`
 
-```yaml
-services:
-  gluetun:
-    image: ghcr.io/qdm12/gluetun:latest
-    mem_limit: 256M
-    container_name: gluetun
-    restart: unless-stopped
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    sysctls:
-      - net.ipv6.conf.all.disable_ipv6=1
-    environment:
-      - VPN_SERVICE_PROVIDER=protonvpn
-      - VPN_TYPE=wireguard
-      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
-      - SERVER_COUNTRIES=${SERVER_COUNTRIES}
-      - SERVER_CITIES=${SERVER_CITIES}
-      - VPN_PORT_FORWARDING=on
-      - TZ=${TZ}
-      - QBT_WEBUI_ENABLED=true
-    volumes:
-      - ${CONFIG}/gluetun:/gluetun
-      - ${CONFIG}/gluetun/auth/config.toml:/gluetun/auth/config.toml:ro
-    ports:
-      - "8080:8080"          # qBittorrent Web UI
-      # - "8191:8191"        # (optional) expose Byparr to the host for debugging
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://google.com"]
-      interval: 30s
-      timeout: 10s
-      retries: 2
-
-  qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
-    container_name: qbittorrent
-    mem_limit: 4G
-    restart: unless-stopped
-    network_mode: "service:gluetun"     # all traffic through the VPN
-    depends_on:
-      gluetun:
-        condition: service_healthy
-    environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
-      - TZ=${TZ}
-      - WEBUI_PORT=8080
-      - QBITTORRENT_INTERFACE=tun0
-      - DOCKER_MODS=ghcr.io/t-anc/gsp-qbittorent-gluetun-sync-port-mod:main
-      - GSP_GTN_API_KEY=${GSP_GTN_API_KEY:-randomapikey}
-      - GSP_QBITTORRENT_PORT=${GSP_QBITTORRENT_PORT:-53764}
-      - GSP_MINIMAL_LOGS=false
-      - BT4G_BYPARR=http://localhost:8191/v1   # bt4gprx plugin -> Byparr
-    volumes:
-      - ${CONFIG}/config:/config
-      - ${CONFIG}/incomplete:/incomplete
-      - ${CONFIG}/DONE:/downloads
-    ulimits:
-      nofile:
-        soft: 32768
-        hard: 65536
-
-  byparr:
-    image: ghcr.io/thephaseless/byparr:latest
-    container_name: byparr
-    mem_limit: 2G                        # anti-detection browser is memory-hungry
-    shm_size: 2gb                        # headless Chrome needs more than 64MB
-    restart: unless-stopped
-    network_mode: "service:gluetun"      # same namespace -> reachable at localhost:8191
-    depends_on:
-      gluetun:
-        condition: service_healthy
-    environment:
-      - TZ=${TZ}
-```
+The file can be found [here to look at](docker-compose.yml).
 
 ### `.env`
 
-```dotenv
-CONFIG=/path/to/your/config
-PUID=1000
-PGID=1000
-TZ=Etc/UTC
-WIREGUARD_PRIVATE_KEY=your_wireguard_private_key
-SERVER_COUNTRIES=Netherlands
-SERVER_CITIES=
-GSP_GTN_API_KEY=randomapikey
-GSP_QBITTORRENT_PORT=53764
-```
+Copy `env.example` to `.env`. Change them to match your env. Please read through 
+the [env.example](env.example) file as it does not contain enough info to start 
+out of the box!
 
 ### Start it
 
 ```bash
-docker compose up -d
+sudo docker compose up -d
 ```
 
 Gluetun comes up first; qBittorrent and Byparr start once the VPN is healthy. The
@@ -204,7 +121,8 @@ Web UI is at `http://<host>:8080`.
 
 > **VPN caveat:** Byparr's challenge-solving requests exit through your VPN IP.
 > Datacenter/VPN IPs draw Cloudflare challenges more often than residential ones,
-> so a solve may occasionally be slow or need a retry.
+> so a solve may occasionally be slow or need a retry. If slow, try changing 
+> `BT4G_FS_TIMEOUT_MS` to something bigger.
 
 ---
 
@@ -219,6 +137,9 @@ directory and persists it in your `/config` volume:
 3. Click **Search plugins…** (bottom right) → **Install a new one**.
 4. Choose **Web link** and paste the raw URL to `bt4gprx.py`, **or** choose
    **Local file** and point to a path reachable inside the container.
+```
+https://raw.githubusercontent.com/iamdoubz/g-qb-flare/refs/heads/main/plugins/bt4gprx/bt4gprx.py
+```
 5. Confirm `bt4gprx` appears in the plugin list and is enabled.
 
 ### Alternative: install by file path
@@ -243,8 +164,6 @@ docker restart qbittorrent
 > Byparr) to extract the real infohash, then builds the magnet locally with the
 > tracker list. Expect a ~30-second pause for that one fetch — it's Byparr clearing
 > Cloudflare, not a hang. It happens once per download, only for the item you grab.
-> The external link hosts (downloadtorrentfile.com / keepshare.org) are never
-> contacted; only the infohash is read from the page.
 
 ### Testing outside qBittorrent
 
@@ -316,18 +235,12 @@ If bt4g changes its categories, edit the `supported_categories` dictionary in
 The plugin builds URLs in this confirmed format:
 
 ```
-https://bt4gprx.com/search?q=<term>&category=<cat>&orderby=seeders&p=<page>
+https://${BT4G_BASE_URL}/search?q=<term>&category=<cat>&orderby=seeders&p=<page>
 ```
 
 - Spaces in the term are encoded as `%20`.
 - `category` is always sent, including `category=all` for "All categories".
 - `orderby` and `p` are configurable/removable via the env vars above.
-
-Example (TV category, page 1):
-
-```
-https://bt4gprx.com/search?q=frieren%20season%202&category=video&orderby=seeders&p=1
-```
 
 ---
 
