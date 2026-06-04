@@ -1,5 +1,5 @@
-#VERSION: 1.05
-# AUTHORS: iamdoubz
+#VERSION: 3.10
+# AUTHORS: (you)
 # LICENSING INFORMATION
 #
 # qBittorrent search plugin for bt4gprx.com (a DHT torrent index).
@@ -41,6 +41,10 @@
 #   BT4G_BYPARR         Byparr (or FlareSolverr) endpoint, e.g. http://localhost:8191/v1
 #   BT4G_FLARESOLVERR   legacy alias for BT4G_BYPARR (same effect)
 #   BT4G_FS_TIMEOUT_MS  solver maxTimeout in milliseconds, default 60000
+#   BT4G_SOLVER_SESSION_TTL    minutes to reuse a saved solver session, default 25
+#                              (slightly under the typical ~30 min cf_clearance lifetime)
+#   BT4G_SOLVER_SESSION_FILE   path for the session-ID file; default /config/bt4g_solver_session.json
+#                              (then /tmp); set to "" to disable session persistence
 #   BT4G_CF_CLEARANCE   manually solved Cloudflare cf_clearance cookie value. When
 #                       set, the plugin skips the solver and sends this cookie on
 #                       direct (curl_cffi/urllib) requests. Bound to IP + User-Agent
@@ -134,6 +138,10 @@ _DEFAULT_TRACKERS = [
     "https://tracker.yemekyedim.com:443/announce",
 ]
 
+# Minimum result size (bytes) for video/audio category searches. Results smaller
+# than this are dropped as likely fakes/samples. 7 MB.
+_MIN_SIZE_BYTES = 7 * 1024 * 1024
+
 # 40-char hex (btih v1) or 32-char base32 info hash.
 _HASH_RE = re.compile(r"\b([A-Fa-f0-9]{40}|[A-Z2-7]{32})\b")
 _MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\"'<>\s]*")
@@ -177,6 +185,20 @@ def _default_log_file():
     return ""
 
 _LOG_FILE = _default_log_file()
+
+# Where to persist the Byparr session ID between searches. Stored as a small JSON
+# file so the session (and its cf_clearance cookie) survives nova2.py restarts.
+# Set BT4G_SOLVER_SESSION_FILE to "" to disable session persistence (ephemeral mode).
+def _default_session_file():
+    env = os.environ.get("BT4G_SOLVER_SESSION_FILE")
+    if env is not None:
+        return env.strip()
+    for d in ("/config", "/tmp"):
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return os.path.join(d, "bt4g_solver_session.json")
+    return ""
+
+_SOLVER_SESSION_FILE = _default_session_file()
 
 
 def _resolve_level():
@@ -278,7 +300,8 @@ class bt4gprx(object):
         else:
             self.cookie = ""
         self._session = None          # lazy curl_cffi session (keeps cf_clearance)
-        self._solver_session = None   # lazy solver (Byparr/FlareSolverr) session id
+        self._solver_session = None   # Byparr session ID (loaded or freshly created)
+        self._solver_session_tried = False  # avoid re-trying failed session creation
         self._trackers = list(_DEFAULT_TRACKERS)
         self._update_trackers = os.environ.get("BT4G_UPDATE_TRACKERS", "1").strip() not in ("0", "false", "no", "")
         self._trackers_loaded = False
@@ -457,12 +480,89 @@ class bt4gprx(object):
             log.warning("urllib error: %s", e)
         return None
 
-    def _fetch_solver(self, url):
+    # --------------------------------------------------------- solver sessions
+    def _load_solver_session(self):
+        """Try to read a saved session ID from disk. Returns the ID string if
+        found and within TTL, otherwise None."""
+        if not _SOLVER_SESSION_FILE:
+            return None
+        try:
+            data = json.loads(open(_SOLVER_SESSION_FILE, encoding="utf-8").read())
+            session_id = data.get("session_id", "").strip()
+            created_at = float(data.get("created_at", 0))
+            ttl_secs = self._int_env("BT4G_SOLVER_SESSION_TTL", 25) * 60
+            if session_id and time.time() - created_at < ttl_secs:
+                return session_id
+        except Exception:
+            pass
+        return None
+
+    def _save_solver_session(self, session_id):
+        """Persist a session ID alongside a creation timestamp."""
+        if not _SOLVER_SESSION_FILE or not session_id:
+            return
+        try:
+            with open(_SOLVER_SESSION_FILE, "w", encoding="utf-8") as fh:
+                json.dump({"session_id": session_id, "created_at": time.time()}, fh)
+            log.debug("saved solver session %s...", session_id[:8])
+        except Exception as e:
+            log.debug("could not save solver session: %s", e)
+
+    def _clear_solver_session(self):
+        """Discard the current session (in memory and on disk) so the next call
+        to _ensure_solver_session creates a fresh one."""
+        self._solver_session = None
+        self._solver_session_tried = False
+        if _SOLVER_SESSION_FILE:
+            try:
+                os.remove(_SOLVER_SESSION_FILE)
+            except Exception:
+                pass
+
+    def _ensure_solver_session(self):
+        """Lazily obtain a solver session ID. Prefers a saved ID (within TTL),
+        then creates a new one via sessions.create. Sets self._solver_session."""
+        if self._solver_session:
+            return
+        if not self._solver_session_tried:
+            self._solver_session_tried = True
+            self._solver_session = self._load_solver_session()
+            if self._solver_session:
+                log.debug("reusing saved solver session %s...", self._solver_session[:8])
+                return
+        # Ask the solver to create a fresh browser session.
+        try:
+            req = urllib.request.Request(
+                self.solver_url,
+                data=json.dumps({"cmd": "sessions.create"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+            session_id = resp.get("session", "").strip()
+            if session_id:
+                self._solver_session = session_id
+                self._save_solver_session(session_id)
+                log.debug("created solver session %s...", session_id[:8])
+            else:
+                log.debug("sessions.create returned no id; using ephemeral mode")
+        except Exception as e:
+            log.debug("sessions.create failed (%s); using ephemeral mode", e)
+
+    def _fetch_solver(self, url, _retry=False):
         """Drive a FlareSolverr-compatible solver (Byparr or legacy FlareSolverr)
         to clear CF and return (html, upstream_status). Returns (None, None) on a
         transport error. A solver that *reached us* but failed to solve the
         challenge (HTTP 500 with a JSON message) is reported distinctly so the
-        log makes clear the problem is the solver/challenge, not connectivity."""
+        log makes clear the problem is the solver/challenge, not connectivity.
+
+        Session reuse: on the first call, _ensure_solver_session() either loads a
+        saved session ID from disk (if within TTL) or creates one via
+        sessions.create. Subsequent calls — both within the same search (in-memory)
+        and across searches within the TTL window (from disk) — reuse the same
+        browser, which already has the solved cf_clearance in its cookie jar and
+        can skip the Cloudflare challenge entirely."""
+        self._ensure_solver_session()
         timeout_ms = self._int_env("BT4G_FS_TIMEOUT_MS", 60000)
         body = None
         try:
@@ -487,13 +587,21 @@ class bt4gprx(object):
                 body = json.loads(r.read().decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as e:
             # The solver answered, but with an error status. Its body usually
-            # carries the real reason (challenge timeout, etc.).
+            # carries the real reason (challenge timeout, stale session, etc.).
             detail = ""
             try:
                 raw = e.read().decode("utf-8", errors="replace")
                 detail = (json.loads(raw).get("message") or raw).strip()
             except Exception:
                 pass
+            # Stale session: the solver no longer knows the saved session ID
+            # (e.g. Byparr was restarted). Clear and retry once with a new session.
+            if not _retry and self._solver_session and (
+                "session" in detail.lower() and "not exist" in detail.lower()
+            ):
+                log.info("saved solver session is stale; creating a new one.")
+                self._clear_solver_session()
+                return self._fetch_solver(url, _retry=True)
             if "challenge" in detail.lower() or "timeout" in detail.lower():
                 log.error(
                     "Solver could not clear Cloudflare for %s (HTTP %s): %s "
@@ -664,6 +772,27 @@ class bt4gprx(object):
         return m
 
     @staticmethod
+    def _size_to_bytes(size_str):
+        """Parse a bt4g size string like '659.00MB', '5.53GB', '783.60 MB' into
+        a byte count. Returns None if it can't be parsed (so callers can choose
+        not to filter rather than wrongly drop an item)."""
+        if not size_str:
+            return None
+        m = re.search(r"([\d.]+)\s*([KMGT]?I?B)", size_str.strip(), re.IGNORECASE)
+        if not m:
+            return None
+        try:
+            value = float(m.group(1))
+        except ValueError:
+            return None
+        unit = m.group(2).upper().replace("I", "")  # treat KiB==KB etc.
+        factor = {"B": 1, "KB": 1024, "MB": 1024**2,
+                  "GB": 1024**3, "TB": 1024**4}.get(unit)
+        if not factor:
+            return None
+        return int(value * factor)
+
+    @staticmethod
     def _date_to_ts(date_str):
         """Convert a 'YYYY-MM-DD' string to a Unix timestamp, or -1 if absent."""
         if not date_str:
@@ -769,6 +898,25 @@ class bt4gprx(object):
             log.debug("page %d: %d new unique row(s) (total=%d)", page, new, len(rows))
             if new == 0:
                 break
+
+        # Minimum-size filter: for video (movie) and audio searches, drop tiny
+        # results (< 7 MB) — typically fakes, samples, or stray text files. Keyed
+        # off the bt4g category value so it covers movies/tv/anime (movie) and
+        # music (audio), but not 'all', doc, app, or other. Items whose size can't
+        # be parsed are kept (we don't drop on uncertainty).
+        bt4g_cat = self.supported_categories.get(cat, "")
+        if bt4g_cat in ("movie", "audio"):
+            kept = []
+            for r in rows:
+                nbytes = self._size_to_bytes(r.get("filesize"))
+                if nbytes is not None and nbytes < _MIN_SIZE_BYTES:
+                    log.debug("filtered (%s < 7MB): %s",
+                              r.get("filesize"), r.get("title"))
+                    continue
+                kept.append(r)
+            log.debug("size filter: %d -> %d result(s) for category %r",
+                      len(rows), len(kept), bt4g_cat)
+            rows = kept
 
         # Convention: most seeds first.
         def _to_int(x):
