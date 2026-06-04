@@ -1,5 +1,5 @@
-#VERSION: 3.10
-# AUTHORS: (you)
+#VERSION: 1.06
+# AUTHORS: iamdoubz
 # LICENSING INFORMATION
 #
 # qBittorrent search plugin for bt4gprx.com (a DHT torrent index).
