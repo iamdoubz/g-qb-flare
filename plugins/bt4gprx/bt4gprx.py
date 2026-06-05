@@ -1,4 +1,4 @@
-#VERSION: 1.06
+#VERSION: 1.07
 # AUTHORS: iamdoubz
 # LICENSING INFORMATION
 #
@@ -482,16 +482,24 @@ class bt4gprx(object):
 
     # --------------------------------------------------------- solver sessions
     def _load_solver_session(self):
-        """Try to read a saved session ID from disk. Returns the ID string if
-        found and within TTL, otherwise None."""
+        """Read the session file. Returns:
+          - a session ID string  → reuse it
+          - "UNSUPPORTED"        → solver doesn't support sessions.create; skip
+          - None                 → no file, expired, or unreadable; try fresh
+        """
         if not _SOLVER_SESSION_FILE:
             return None
         try:
             data = json.loads(open(_SOLVER_SESSION_FILE, encoding="utf-8").read())
-            session_id = data.get("session_id", "").strip()
             created_at = float(data.get("created_at", 0))
             ttl_secs = self._int_env("BT4G_SOLVER_SESSION_TTL", 25) * 60
-            if session_id and time.time() - created_at < ttl_secs:
+            if time.time() - created_at >= ttl_secs:
+                return None  # expired
+            if data.get("type") == "unsupported":
+                return "UNSUPPORTED"
+            # Legacy format (no "type" key) and current session format.
+            session_id = data.get("session_id", "").strip()
+            if session_id:
                 return session_id
         except Exception:
             pass
@@ -503,10 +511,22 @@ class bt4gprx(object):
             return
         try:
             with open(_SOLVER_SESSION_FILE, "w", encoding="utf-8") as fh:
-                json.dump({"session_id": session_id, "created_at": time.time()}, fh)
+                json.dump({"type": "session",
+                           "session_id": session_id,
+                           "created_at": time.time()}, fh)
             log.debug("saved solver session %s...", session_id[:8])
         except Exception as e:
             log.debug("could not save solver session: %s", e)
+
+    def _save_unsupported_marker(self):
+        """Persist a marker so subsequent searches skip sessions.create."""
+        if not _SOLVER_SESSION_FILE:
+            return
+        try:
+            with open(_SOLVER_SESSION_FILE, "w", encoding="utf-8") as fh:
+                json.dump({"type": "unsupported", "created_at": time.time()}, fh)
+        except Exception:
+            pass
 
     def _clear_solver_session(self):
         """Discard the current session (in memory and on disk) so the next call
@@ -520,17 +540,24 @@ class bt4gprx(object):
                 pass
 
     def _ensure_solver_session(self):
-        """Lazily obtain a solver session ID. Prefers a saved ID (within TTL),
-        then creates a new one via sessions.create. Sets self._solver_session."""
+        """Lazily obtain a solver session ID. On the first call per process, tries
+        to load a saved session from disk (within TTL). If none exists, asks the
+        solver to create one via sessions.create. If the solver returns 500 (e.g.
+        Byparr doesn't implement sessions.create), saves an 'unsupported' marker so
+        future invocations skip the attempt silently and use ephemeral mode."""
         if self._solver_session:
             return
         if not self._solver_session_tried:
             self._solver_session_tried = True
-            self._solver_session = self._load_solver_session()
-            if self._solver_session:
-                log.debug("reusing saved solver session %s...", self._solver_session[:8])
+            loaded = self._load_solver_session()
+            if loaded == "UNSUPPORTED":
+                log.debug("solver sessions not supported (cached); using ephemeral mode")
                 return
-        # Ask the solver to create a fresh browser session.
+            if loaded:
+                self._solver_session = loaded
+                log.debug("reusing saved solver session %s...", loaded[:8])
+                return
+        # Try to create a new named session.
         try:
             req = urllib.request.Request(
                 self.solver_url,
@@ -546,6 +573,19 @@ class bt4gprx(object):
                 log.debug("created solver session %s...", session_id[:8])
             else:
                 log.debug("sessions.create returned no id; using ephemeral mode")
+        except urllib.error.HTTPError as e:
+            if e.code == 500:
+                # Solver doesn't implement sessions.create (common with Byparr).
+                # Save a marker so we don't repeat the attempt this session.
+                self._save_unsupported_marker()
+                log.info(
+                    "Solver does not support named sessions (sessions.create returned "
+                    "HTTP 500 — this is normal for Byparr). Using ephemeral mode: "
+                    "each search opens a fresh browser. Everything still works; "
+                    "session reuse is simply unavailable with this solver."
+                )
+            else:
+                log.debug("sessions.create failed (HTTP %s); using ephemeral mode", e.code)
         except Exception as e:
             log.debug("sessions.create failed (%s); using ephemeral mode", e)
 
