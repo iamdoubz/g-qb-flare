@@ -1,4 +1,4 @@
-# VERSION: 1.02
+# VERSION: 1.03
 # AUTHORS: iamdoubz
 #
 # The Pirate Bay search engine for qBittorrent, backed by the apibay.org JSON API.
@@ -10,7 +10,9 @@
 #     and an optional "movies/tv must have an IMDb id" filter.
 #
 # Magic search terms (type these in the search box):
-#   top100   (or: top)      -> Top 100 for the selected category
+#   top100                  -> Top 100 for the selected category
+#   top100:207              -> Top 100 for a specific TPB category id (207 = HD Movies)
+#   top100:all              -> Top 100 across all categories
 #   recent   (or: latest)   -> 100 most recently added torrents (any category)
 #   tt1234567               -> search by IMDb id (exact title matches)
 #
@@ -113,15 +115,18 @@ class tpb(object):
     }
 
     def search(self, what, cat='all'):
-        mode = self._special(what)
+        special = self._special(what)
 
-        if mode == 'recent':
-            url = self.api + '/precompiled/data_top100_recent.json'
-            self._output(self._get_json(url), sort=False)
-            return
-
-        if mode == 'top100':
-            self._output(self._top100(cat), sort=False)
+        if special is not None:
+            kind, arg = special
+            if kind == 'recent':
+                url = self.api + '/precompiled/data_top100_recent.json'
+                self._output(self._get_json(url), sort=False)
+            elif arg:  # explicit id, e.g. top100:207  ->  HD Movies top 100
+                url = self.api + '/precompiled/data_top100_%s.json' % arg
+                self._output(self._get_json(url), sort=False)
+            else:       # plain top100  ->  use the selected category's chain
+                self._output(self._top100(cat), sort=False)
             return
 
         # Normal search: query each category code in parallel, then merge.
@@ -139,12 +144,18 @@ class tpb(object):
     # --- internals -------------------------------------------------------
 
     def _special(self, what):
+        # Returns None for a normal search, or (kind, arg) where kind is
+        # 'top100' or 'recent'. For 'top100', arg is None (use the selected
+        # category), 'all', or a TPB category id like '207'.
         q = urllib.parse.unquote(what).strip().lower()
-        if q in ('top', 'top100', ':top', 'top:100', '!top'):
-            return 'top100'
-        if q in ('recent', 'latest', ':recent', 'top:recent',
-                 'top100:recent', '!recent'):
-            return 'recent'
+        if q in ('recent', 'latest', '!recent'):
+            return ('recent', None)
+        m = re.match(r'^(?:top100|top)(?::([a-z0-9]+))?$', q)
+        if m:
+            arg = m.group(1)
+            if arg == 'recent':
+                return ('recent', None)
+            return ('top100', arg)  # arg is None, 'all', or e.g. '207'
         return None
 
     def _top100(self, cat):
