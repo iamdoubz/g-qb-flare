@@ -1,4 +1,4 @@
-# VERSION: 1.00
+# VERSION: 1.02
 # AUTHORS: iamdoubz
 #
 # The Pirate Bay search engine for qBittorrent, backed by the apibay.org JSON API.
@@ -79,10 +79,10 @@ _USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 _IMDB_RE = re.compile(r'^tt\d{7,8}$')
 
 
-class apibay(object):
+class tpb(object):
     url = 'https://thepiratebay.org'
     api = 'https://apibay.org'
-    name = 'The Pirate Bay (apibay)'
+    name = 'The Pirate Bay'
 
     # qBittorrent category -> apibay category id(s) to query (comma-separated).
     # Empty value means "no category filter" (search everything).
@@ -245,7 +245,7 @@ class apibay(object):
 
 if __name__ == '__main__':
     import sys
-    engine = apibay()
+    engine = tpb()
     args = sys.argv[1:]
     category = 'all'
     if len(args) >= 2 and args[0] in engine.supported_categories:
