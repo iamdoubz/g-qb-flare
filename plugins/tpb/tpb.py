@@ -1,4 +1,4 @@
-# VERSION: 1.03
+# VERSION: 1.04
 # AUTHORS: iamdoubz
 #
 # The Pirate Bay search engine for qBittorrent, backed by the apibay.org JSON API.
@@ -13,6 +13,8 @@
 #   top100                  -> Top 100 for the selected category
 #   top100:207              -> Top 100 for a specific TPB category id (207 = HD Movies)
 #   top100:all              -> Top 100 across all categories
+#   top100:48h_207          -> Top 100 in category 207 uploaded in the last 48 hours
+#   top100:48h              -> Top 100 (last 48 hours) for the selected category
 #   recent   (or: latest)   -> 100 most recently added torrents (any category)
 #   tt1234567               -> search by IMDb id (exact title matches)
 #
@@ -122,11 +124,12 @@ class tpb(object):
             if kind == 'recent':
                 url = self.api + '/precompiled/data_top100_recent.json'
                 self._output(self._get_json(url), sort=False)
-            elif arg:  # explicit id, e.g. top100:207  ->  HD Movies top 100
+            elif arg in (None, '48h'):  # selected category's chain
+                window = '48h' if arg == '48h' else None
+                self._output(self._top100(cat, window), sort=False)
+            else:       # explicit id, e.g. top100:207 or top100:48h_207
                 url = self.api + '/precompiled/data_top100_%s.json' % arg
                 self._output(self._get_json(url), sort=False)
-            else:       # plain top100  ->  use the selected category's chain
-                self._output(self._top100(cat), sort=False)
             return
 
         # Normal search: query each category code in parallel, then merge.
@@ -145,22 +148,25 @@ class tpb(object):
 
     def _special(self, what):
         # Returns None for a normal search, or (kind, arg) where kind is
-        # 'top100' or 'recent'. For 'top100', arg is None (use the selected
-        # category), 'all', or a TPB category id like '207'.
+        # 'top100' or 'recent'. For 'top100', arg is None (selected category),
+        # 'all', a TPB category id like '207', '48h' (last-48h of the selected
+        # category), or '48h_207' (last-48h of a specific category id).
         q = urllib.parse.unquote(what).strip().lower()
         if q in ('recent', 'latest', '!recent'):
             return ('recent', None)
-        m = re.match(r'^(?:top100|top)(?::([a-z0-9]+))?$', q)
+        m = re.match(r'^(?:top100|top)(?::([a-z0-9_]+))?$', q)
         if m:
             arg = m.group(1)
             if arg == 'recent':
                 return ('recent', None)
-            return ('top100', arg)  # arg is None, 'all', or e.g. '207'
+            return ('top100', arg)  # None, 'all', '207', '48h', '48h_207', ...
         return None
 
-    def _top100(self, cat):
+    def _top100(self, cat, window=None):
+        prefix = (window + '_') if window else ''  # e.g. '48h_'
         for cid in self.top100_categories.get(cat, ['all']):
-            rows = self._get_json(self.api + '/precompiled/data_top100_%s.json' % cid)
+            url = self.api + '/precompiled/data_top100_%s%s.json' % (prefix, cid)
+            rows = self._get_json(url)
             if rows:
                 return rows
         return []
